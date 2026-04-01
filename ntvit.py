@@ -2,6 +2,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 from math import ceil, floor, log2
 import copy
 import os
+import nibabel as nib
 import shutil
 import einops
 import numpy as np
@@ -820,17 +821,21 @@ class NTViT(pl.LightningModule):
                 except Exception as e:
                     print(f"image logging failed: {e}")
 
-            # save prediction volumes during validation
+            # accumulate prediction volumes during validation for 4D NIfTI saving
             if not self.training and self.predictions_path is not None:
-                latest_dir = os.path.join(self.predictions_path, "latest")
-                os.makedirs(latest_dir, exist_ok=True)
                 for i in range(outs["fmris_rec"].shape[0]):
                     subject_id = batch["subject_id"][i]
                     sample_name = os.path.splitext(os.path.basename(batch["fmris_path"][i]))[0]
+                    try:
+                        time_idx = int(sample_name.split("_")[-1])
+                    except ValueError:
+                        time_idx = sample_name
                     pred = outs["fmris_rec"][i].detach().cpu().numpy()
                     gt = outs["fmris_gt"][i].detach().cpu().numpy()
-                    np.save(os.path.join(latest_dir, f"sub-{subject_id}_sample-{sample_name}_pred.npy"), pred)
-                    np.save(os.path.join(latest_dir, f"sub-{subject_id}_sample-{sample_name}_gt.npy"), gt)
+                    if subject_id not in self._val_volumes:
+                        self._val_volumes[subject_id] = {"pred": {}, "gt": {}}
+                    self._val_volumes[subject_id]["pred"][time_idx] = pred
+                    self._val_volumes[subject_id]["gt"][time_idx] = gt
 
         return outs
 
@@ -1094,9 +1099,25 @@ class NTViT(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         return self.shared_step(batch, batch_idx)
 
+    def on_validation_epoch_start(self):
+        self._val_volumes = {}
+
     def on_validation_epoch_end(self):
         if self.predictions_path is None:
             return
+        if hasattr(self, "_val_volumes") and self._val_volumes:
+            latest_dir = os.path.join(self.predictions_path, "latest")
+            os.makedirs(latest_dir, exist_ok=True)
+            affine = np.eye(4)
+            for subject_id, buffers in self._val_volumes.items():
+                for tag, vol_dict in buffers.items():
+                    sorted_keys = sorted(vol_dict.keys())
+                    volumes = [vol_dict[k] for k in sorted_keys]
+                    stack = np.stack(volumes, axis=0).astype(np.float32)       # (t, y, x, z)
+                    stack = einops.rearrange(stack, "t y x z -> x z y t")     # back to NIfTI order
+                    img = nib.Nifti1Image(stack, affine)
+                    nib.save(img, os.path.join(latest_dir, f"sub-{subject_id}_{tag}.nii.gz"))
+            self._val_volumes = {}
         ssim_key = f"{self.logger_prefix + '/' if self.logger_prefix else ''}val/ssim"
         current_ssim = self.trainer.callback_metrics.get(ssim_key, None)
         if current_ssim is None:

@@ -248,7 +248,7 @@ if __name__ == "__main__":
             ModelCheckpoint(
                 monitor=f"run_{run['subject_id']}/val/ssim",
                 dirpath=join(project_path, "checkpoints"),
-                filename=f"{args.dataset_type}-" + "{epoch:02d}-" + f"run={run['subject_id']}",
+                filename=f"{args.dataset_type}-" + "{epoch:02d}-" + f"heldout={run['subject_id']}",
                 mode="max",
                 save_last=True,
             ),
