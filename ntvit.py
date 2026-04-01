@@ -1,5 +1,6 @@
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 from math import ceil, floor, log2
+import copy
 import os
 import shutil
 import einops
@@ -89,7 +90,34 @@ class GaussianNoise(nn.Module):
             return x + noise
         else:
             return x
-
+# "in_reshaper": nn.Sequential(
+#     GaussianNoise(input_noise),
+#     Unfolder(patches_size=patches_size, padding=padding),
+#     # nn.ZeroPad2d(padding),
+#     # nn.Unfold(kernel_size=patches_size, stride=patches_size),
+#     # Rearrange("b c w -> b w c"),
+#     nn.Linear(in_channels * patches_size**2, 2048),
+#     nn.LayerNorm(2048),
+#     self.activation_module,
+#     nn.Linear(2048, h_dim),
+# ),
+class InReshaper(nn.Module):
+    def __init__(self, input_noise, patches_size, padding, in_channels, h_dim, activation_module, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.a = GaussianNoise(input_noise)
+        self.b = Unfolder(patches_size=patches_size, padding=padding)
+        self.c = nn.Linear(in_channels * patches_size ** 2, 2048)
+        self.d = nn.LayerNorm(2048)
+        self.activation_module = activation_module
+        self.e = nn.Linear(2048, h_dim)
+    def forward(self, x):
+        y = self.a(x)
+        y = self.b(y)
+        y = self.c(y)  # breaks here
+        y = self.d(y)
+        y = self.activation_module(y)
+        y = self.e(y)
+        return y
 
 class NTViT(pl.LightningModule):
     def __init__(
@@ -347,7 +375,7 @@ class NTViT(pl.LightningModule):
         class DummyModel(nn.Module):
             def __init__(self, original_model):
                 super(DummyModel, self).__init__()
-                self.original_model = original_model
+                self.original_model = copy.deepcopy(original_model)
 
             def forward(self, x):
                 return self.original_model.shared_step(x, 0)
@@ -430,17 +458,25 @@ class NTViT(pl.LightningModule):
         assert 0 <= dropout < 1
         assert 0 <= input_noise < 1
         modules = {
-            "in_reshaper": nn.Sequential(
-                GaussianNoise(input_noise),
-                Unfolder(patches_size=patches_size, padding=padding),
-                # nn.ZeroPad2d(padding),
-                # nn.Unfold(kernel_size=patches_size, stride=patches_size),
-                # Rearrange("b c w -> b w c"),
-                nn.Linear(in_channels * patches_size**2, 2048),
-                nn.LayerNorm(2048),
-                self.activation_module,
-                nn.Linear(2048, h_dim),
+            "in_reshaper": InReshaper(
+                in_channels=in_channels,
+                patches_size=patches_size,
+                h_dim=h_dim,
+                padding=padding,
+                activation_module=self.activation_module,
+                input_noise=input_noise,
             ),
+            # "in_reshaper": nn.Sequential(
+            #     GaussianNoise(input_noise),
+            #     Unfolder(patches_size=patches_size, padding=padding),
+            #     # nn.ZeroPad2d(padding),
+            #     # nn.Unfold(kernel_size=patches_size, stride=patches_size),
+            #     # Rearrange("b c w -> b w c"),
+            #     nn.Linear(in_channels * patches_size**2, 2048),
+            #     nn.LayerNorm(2048),
+            #     self.activation_module,
+            #     nn.Linear(2048, h_dim),
+            # ),
             "encoder": nn.TransformerEncoder(
                 encoder_layer=nn.TransformerEncoderLayer(
                     d_model=h_dim,
@@ -643,7 +679,7 @@ class NTViT(pl.LightningModule):
             outs["loss_G_cm"] = centroid_loss(
                 pred=outs["fmris_rec"],
                 gt=outs["fmris_gt"],
-            )        
+            )
         if self.use_kl_loss:
             outs["loss_G_kl"] = sum([
                 F.kl_div(
@@ -651,9 +687,9 @@ class NTViT(pl.LightningModule):
                     target=F.softmax(target, dim=1),
                     reduction="batchmean",
                 ) * 1e-3
-                for input, target in [(outs["fmris_rec"], outs["fmris_gt"]), 
+                for input, target in [(outs["fmris_rec"], outs["fmris_gt"]),
                                       (outs["eegs_latent"], torch.randn_like(outs["eegs_latent"]))]
-            ]) 
+            ])
         # outs["loss_G_energy"] = energy_loss(
         #     pred=outs["fmris_rec"],
         #     gt=outs["fmris_gt"],
@@ -690,7 +726,7 @@ class NTViT(pl.LightningModule):
                         target=F.softmax(torch.randn_like(outs["fmris_latent"]), dim=1),
                         reduction="batchmean",
                     ) * 1e-3
-                ]) 
+                ])
             outs["loss_G_dm"] = self.reconstruction_loss(
                 pred=outs["eegs_latent"],
                 gt=outs["fmris_latent"].detach(),
@@ -996,7 +1032,7 @@ class NTViT(pl.LightningModule):
             target=gt.detach(),
             reduction="mean",
         )
-        
+
     @staticmethod
     def rmse(pred, gt):
         return torch.sqrt(F.mse_loss(
@@ -1034,6 +1070,7 @@ class NTViT(pl.LightningModule):
         return torchmetrics.functional.image.peak_signal_noise_ratio(
             preds=pred.detach(),
             target=gt.detach(),
+            data_range=gt.detach().max() - gt.detach().min(),
         )
 
     @staticmethod
