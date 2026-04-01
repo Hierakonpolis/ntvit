@@ -2,3 +2,4 @@ logs
 .conda
 __pycache__
 *:Zone.Identifier
+.idea
