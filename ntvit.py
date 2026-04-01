@@ -1,6 +1,9 @@
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 from math import ceil, floor, log2
+import os
+import shutil
 import einops
+import numpy as np
 from einops.layers.torch import Rearrange
 from torch import nn
 import pytorch_lightning as pl
@@ -10,7 +13,6 @@ import torch.autograd.profiler as profiler
 import torchaudio
 import torchmetrics
 from thop import profile
-import wandb
 
 from losses import centroid_loss, custom_loss, energy_loss, shape_loss, ssim_loss
 
@@ -120,6 +122,7 @@ class NTViT(pl.LightningModule):
         weight_decay: float = 1e-2,
         plot_images: bool = False,
         logger_prefix: Optional[str] = None,
+        predictions_path: Optional[str] = None,
     ):
         super(NTViT, self).__init__()
 
@@ -128,6 +131,8 @@ class NTViT(pl.LightningModule):
         self.logger_prefix = logger_prefix
         assert isinstance(plot_images, bool)
         self.plot_images = plot_images
+        self.predictions_path = predictions_path
+        self._best_val_ssim = float("-inf")
 
         ##################################
         ##################################
@@ -370,7 +375,7 @@ class NTViT(pl.LightningModule):
                 print("error with thop", e)
                 self.macs, self.n_params = 0, 0
 
-        self.save_hyperparameters(ignore=["eegs_mel_spectrogrammer"])
+        self.save_hyperparameters(ignore=["eegs_mel_spectrogrammer", "predictions_path"])
 
     def configure_optimizers(self):
         # optimizers
@@ -386,7 +391,7 @@ class NTViT(pl.LightningModule):
             opt,
             T_0=10,
             eta_min=5e-5,
-            verbose=False,
+            # verbose=False,
         )
         if self.use_discriminator:
             disc_modules = [self.fmris_discriminator_encoder, self.fmris_discriminator]
@@ -758,45 +763,38 @@ class NTViT(pl.LightningModule):
                 on_epoch=True,
             )
             if self.plot_images and batch_idx == 0:
-                for i in range(1):
-                    outs[f"images/fmris_pc_{i}"] = wandb.Image(
-                        plot_reconstructed_fmris(
-                            fmris_pred=outs["fmris_rec"][i],
-                            fmris_gt=outs["fmris_gt"][i],
-                            vmin=0,
-                            vmax=1,
-                            mode="pc",
-                        ),
-                        caption=f"generated fMRIs for sample {i}, point cloud",
-                    )
-                    outs[f"images/fmris_mip_{i}"] = wandb.Image(
-                        plot_reconstructed_fmris(
-                            fmris_pred=outs["fmris_rec"][i],
-                            fmris_gt=outs["fmris_gt"][i],
-                            vmin=0,
-                            vmax=1,
-                            mode="mip",
-                        ),
-                        caption=f"generated fMRIs for sample {i}, MIP",
-                    )
                 try:
-                    wandb.log(
-                        {
-                            f"{self.logger_prefix + '/' if self.logger_prefix else ''}{self.get_phase_name()}/{k}": v
-                            for k, v in outs.items()
-                            if isinstance(v, wandb.Image)
-                        }
-                    )
-                except:
-                    print("wandb may not be the current logger")
-            # outs[f"images/eegs_gt"] = wandb.Image(
-            #     plot_reconstructed_spectrograms(
-            #         sg_pred=outs["eegs_mel_spectrogram_gt"][0, :8],
-            #         sg_gt=outs["eegs_mel_spectrogram_gt"][0, :8],
-            #         vmin=0,
-            #     ),
-            #     caption=f"ground truth EEGs for sample 0",
-            # )
+                    prefix = f"{self.logger_prefix + '/' if self.logger_prefix else ''}{self.get_phase_name()}"
+                    for i in range(1):
+                        for mode in ["pc", "mip"]:
+                            img = plot_reconstructed_fmris(
+                                fmris_pred=outs["fmris_rec"][i],
+                                fmris_gt=outs["fmris_gt"][i],
+                                vmin=0,
+                                vmax=1,
+                                mode=mode,
+                            )
+                            # img is HxWxC float32 numpy array; TensorBoard expects CxHxW
+                            img_tensor = torch.from_numpy(img).permute(2, 0, 1)
+                            self.logger.experiment.add_image(
+                                f"{prefix}/fmris_{mode}_{i}",
+                                img_tensor,
+                                self.global_step,
+                            )
+                except Exception as e:
+                    print(f"image logging failed: {e}")
+
+            # save prediction volumes during validation
+            if not self.training and self.predictions_path is not None:
+                latest_dir = os.path.join(self.predictions_path, "latest")
+                os.makedirs(latest_dir, exist_ok=True)
+                for i in range(outs["fmris_rec"].shape[0]):
+                    subject_id = batch["subject_id"][i]
+                    sample_name = os.path.splitext(os.path.basename(batch["fmris_path"][i]))[0]
+                    pred = outs["fmris_rec"][i].detach().cpu().numpy()
+                    gt = outs["fmris_gt"][i].detach().cpu().numpy()
+                    np.save(os.path.join(latest_dir, f"sub-{subject_id}_sample-{sample_name}_pred.npy"), pred)
+                    np.save(os.path.join(latest_dir, f"sub-{subject_id}_sample-{sample_name}_gt.npy"), gt)
 
         return outs
 
@@ -1058,6 +1056,23 @@ class NTViT(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         return self.shared_step(batch, batch_idx)
+
+    def on_validation_epoch_end(self):
+        if self.predictions_path is None:
+            return
+        ssim_key = f"{self.logger_prefix + '/' if self.logger_prefix else ''}val/ssim"
+        current_ssim = self.trainer.callback_metrics.get(ssim_key, None)
+        if current_ssim is None:
+            return
+        current_ssim = current_ssim.item()
+        if current_ssim > self._best_val_ssim:
+            self._best_val_ssim = current_ssim
+            latest_dir = os.path.join(self.predictions_path, "latest")
+            best_dir = os.path.join(self.predictions_path, "best")
+            if os.path.isdir(latest_dir):
+                if os.path.isdir(best_dir):
+                    shutil.rmtree(best_dir)
+                shutil.copytree(latest_dir, best_dir)
 
     def get_dataloader_length(self):
         if self.training:

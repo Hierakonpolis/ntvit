@@ -10,13 +10,12 @@ import argparse
 import torch
 from torch.utils.data import DataLoader, Subset
 import pytorch_lightning as pl
-from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks import ModelCheckpoint
-import wandb
 
 from ntvit import NTViT
-from utils import download_from_wandb, get_loso_runs, get_kfold_runs, get_simple_split_runs, set_seed
+from utils import get_loso_runs, get_kfold_runs, get_simple_split_runs, set_seed
 
 if __name__ == "__main__":
     ##############################
@@ -134,11 +133,6 @@ if __name__ == "__main__":
         help="Whether to plot images in the logger",
     )
     parser.add_argument(
-        "--save_weights",
-        action="store_true",
-        help="Whether to save the weights of the model",
-    )
-    parser.add_argument(
         "--early_stopping",
         action="store_true",
         help="Whether to enable early stopping",
@@ -179,12 +173,10 @@ if __name__ == "__main__":
     subject_ids = dataset.subject_ids
     
     # logger setup
-    wandb.login()
-    wandb_logger = WandbLogger(
-        project=project_name,
-        name=subtitle,
+    tb_logger = TensorBoardLogger(
         save_dir=project_path,
-        log_model=False,
+        name="",
+        version="",
     )
 
     # loops through the splits
@@ -194,11 +186,11 @@ if __name__ == "__main__":
         runs = get_loso_runs(dataset)
     elif args.validation == "kfold":
         runs = get_kfold_runs(dataset, k=args.k)
-    
+
     if args.max_runs:
         runs = runs[:args.max_runs]
     for i_run, run in tqdm(enumerate(runs), desc="subjects", total=len(runs)):
-        # dataset 
+        # dataset
         train_indices, val_indices = run["train_indices"], run["val_indices"]
         dataset_train = Subset(dataset, indices=train_indices)
         dataset_val = Subset(dataset, indices=val_indices)
@@ -219,6 +211,8 @@ if __name__ == "__main__":
             num_workers=4,
             pin_memory=True,
         )
+        # predictions are saved under project_path/predictions/sub-{subject_id}/
+        predictions_path = join(project_path, "predictions", f"sub-{run['subject_id']}")
         # model
         model = NTViT(
             fmris_shape=dataset.fmris_shape,
@@ -247,18 +241,18 @@ if __name__ == "__main__":
             use_disp_loss=args.use_disp_loss,
             plot_images=args.plot_images,
             logger_prefix=f"run_{run['subject_id']}",
+            predictions_path=predictions_path,
         )
         # callbacks
-        callbacks = []
-        if args.save_weights:
-            callbacks.append(
-                ModelCheckpoint(
-                    monitor=f"run_{run['subject_id']}/val/ssim",
-                    dirpath=project_path,
-                    filename=f"{args.dataset_type}-" + "{epoch:02d}-" + f"run={run['subject_id']}", 
-                    mode="max",
-                ),
-            )
+        callbacks = [
+            ModelCheckpoint(
+                monitor=f"run_{run['subject_id']}/val/ssim",
+                dirpath=join(project_path, "checkpoints"),
+                filename=f"{args.dataset_type}-" + "{epoch:02d}-" + f"run={run['subject_id']}",
+                mode="max",
+                save_last=True,
+            ),
+        ]
         if args.early_stopping:
             callbacks.append(
                 EarlyStopping(monitor="val/loss_G", min_delta=0, patience=10, verbose=True, mode="min"),
@@ -268,17 +262,11 @@ if __name__ == "__main__":
             devices=1,
             accelerator="gpu" if device == "cuda" else "cpu",
             precision="16-mixed" if device == "cuda" else 32,
-            logger=wandb_logger,
+            logger=tb_logger,
             log_every_n_steps=5,
             max_epochs=args.max_epochs,
             callbacks=callbacks,
-            enable_checkpointing=args.save_weights,
+            enable_checkpointing=True,
             enable_model_summary=len(runs) == 1,
         )
         trainer.fit(model, dataloader_train, dataloader_val)
-    download_from_wandb(
-        user_id=wandb_logger.experiment.entity,
-        project_id=wandb_logger.experiment.project,
-        run_id=wandb_logger.experiment.id,
-        output_folder=join("logs", subtitle),
-    )
